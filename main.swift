@@ -1,65 +1,170 @@
 import Foundation
 
-struct Game {
-    var secretCode: [Int]
-    
-    init() {
-        secretCode = (0..<4).map { _ in Int.random(in: 1...6) }
-    }
-    
-    func checkGuess(guess: [Int]) -> String {
-        var blackPins = 0
-        var whitePins = 0
-        var secretCodeCopy = secretCode
-        var guessCopy = guess
-        
-        for i in 0..<4 {
-            if guess[i] == secretCode[i] {
-                blackPins += 1
-                secretCodeCopy[i] = -1
-                guessCopy[i] = -2
-            }
-        }
-        
-        for i in 0..<4 {
-            if guessCopy[i] != -2, let index = secretCodeCopy.firstIndex(of: guessCopy[i]) {
-                whitePins += 1
-                secretCodeCopy[index] = -1
-            }
-        }
-        
-        return String(repeating: "B", count: blackPins) + String(repeating: "W", count: whitePins)
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
+struct GameResponse: Decodable {
+    let gameID: String
+
+    enum CodingKeys: String, CodingKey {
+        case gameID = "game_id"
     }
 }
 
-let game = Game()
-print("Welcome to Mastermind!")
-print("Guess the 4-digit code. Each digit is between 1-6.")
-print("Type 'exit' to quit.")
+struct GuessResponse: Decodable {
+    let black: Int
+    let white: Int
+}
 
-while true {
-    print("\nEnter your guess: ", terminator: "")
-    guard let input = readLine() else {
-        print("Invalid input. Try again.")
-        continue
+class MastermindAPI {
+    let baseURL = "https://mastermind.darkube.app"
+    var gameID: String?
+
+    func startGame(completion: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "\(baseURL)/game") else {
+            completion(false)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data, error == nil else {
+                print("Error starting game: \(error?.localizedDescription ?? "unknown error")")
+                completion(false)
+                return
+            }
+
+            do {
+                let gameResp = try JSONDecoder().decode(GameResponse.self, from: data)
+                self.gameID = gameResp.gameID
+                completion(true)
+            } catch {
+                print("Decoding error: \(error)")
+                print("Raw response: \(String(data: data, encoding: .utf8) ?? "nil")")
+                completion(false)
+            }
+        }.resume()
     }
-    
-    if input.lowercased() == "exit" {
-        print("Thanks for playing! The secret code was \(game.secretCode).")
+
+    func makeGuess(_ guess: [Int], completion: @escaping (GuessResponse?) -> Void) {
+        guard let gameID = gameID, let url = URL(string: "\(baseURL)/guess") else {
+            completion(nil)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let guessString = guess.map(String.init).joined()
+        let body: [String: Any] = ["game_id": gameID, "guess": guessString]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data, error == nil else {
+                print("Error making guess: \(error?.localizedDescription ?? "unknown error")")
+                completion(nil)
+                return
+            }
+
+            if let errorResp = try? JSONDecoder().decode([String: String].self, from: data),
+                let message = errorResp["error"]
+            {
+                print("Server error: \(message)")
+                completion(nil)
+                return
+            }
+
+            do {
+                let guessResp = try JSONDecoder().decode(GuessResponse.self, from: data)
+                completion(guessResp)
+            } catch {
+                print("Decoding error: \(error)")
+                print("Raw response: \(String(data: data, encoding: .utf8) ?? "nil")")
+                completion(nil)
+            }
+        }.resume()
+    }
+
+    func deleteGame(completion: @escaping (Bool) -> Void) {
+        guard let gameID = gameID, let url = URL(string: "\(baseURL)/game/\(gameID)") else {
+            completion(false)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                print("Error deleting game: \(error.localizedDescription)")
+                completion(false)
+                return
+            }
+
+            if let httpResp = response as? HTTPURLResponse,
+                (200...299).contains(httpResp.statusCode)
+            {
+                completion(true)
+            } else {
+                completion(false)
+            }
+        }.resume()
+    }
+}
+
+let api = MastermindAPI()
+
+print("Starting game...")
+let semaphore = DispatchSemaphore(value: 0)
+
+api.startGame { success in
+    if success {
+        print("Game started! GameID: \(api.gameID!)")
+    } else {
+        print("Failed to start game")
         exit(0)
     }
-    
+    semaphore.signal()
+}
+
+semaphore.wait()
+
+func endGame() {    
+    api.deleteGame { success in
+        if success {
+            print("Game deleted successfully.")
+        } else {
+            print("Failed to delete game.")
+        }
+        exit(0)
+    }    
+    }
+var gameOver = false
+while !gameOver {
+    print("\nEnter your guess (4 digits 1-6, type 'exit' to quit): ", terminator: "")
+    guard let input = readLine() else { continue }
+    if input.lowercased() == "exit" {
+        gameOver = true
+        endGame()
+
+    }
+
     let guess = input.compactMap { Int(String($0)) }
-    if guess.count != 4 || !guess.allSatisfy({ 1...6 ~= $0 }) {
-        print("Invalid guess. Enter 4 digits, each from 1 to 6.")
-        continue
+    let guessSemaphore = DispatchSemaphore(value: 0)
+    api.makeGuess(guess) { guessResp in
+        if let guessResp = guessResp {
+            print("Result: \(guessResp.black) black, \(guessResp.white) white")
+            if guessResp.black == 4 {
+                print("Congratulations! You guessed the code!")
+                gameOver = true
+                endGame()
+            }
+        }
+        guessSemaphore.signal()
     }
-    
-    let result = game.checkGuess(guess: guess)
-    print("Result: \(result)")
-    
-    if result == "BBBB" {
-        print("Congratulations! You guessed the code!")
-        break
-    }
+    guessSemaphore.wait()
 }
